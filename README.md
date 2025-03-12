@@ -89,3 +89,5 @@ essentialy all configuration can be set for rust under `.env` file where importa
 `UNIX_SOCKET_FOLDER=/tmp/sessions/` path where you wihs to create socket files, make sure this is same set for caddy to point on that path
 
 `TTYD_SESSION_TIMEOUT=1800` auto stop all the process which are spawned using ttyd running no longer than 30 mins, note this param is in secs 
+
+some changes 
