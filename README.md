@@ -1,93 +1,51 @@
+# LXC web terminal 
 
+This project aims to provide web based access to the bash based terminals of LXC containers 
 
-## 1. install ttyd(using snap is easiest)
-https://github.com/tsl0922/ttyd
+## Supported Features
 
-this will open Unix domain socket file for each session on `/tmp/` directory something like this `/tmp/socket.sock` and must have `666` permission set on current user group 
+- launch a new terminal interface for a specified container
+- close the terminal session based upon REST API request
+- Auto session timeout parameter which can be configured (default 30mins)
+- Unix domain socket based routing which makes spawning session easy
+- Caddy reverse proxy for providing http URI to UDS based routing 
+- JWT token authentication in the header using caddy-jwt plugin
 
-## 2. install caddy
-https://caddyserver.com/docs/install
+## dependencies
 
-## 3. setup caddy configuration 
-have caddy binary file which is provided through git large file storage service 
+- Caddy reverse proxy with custom plugin built of caddy-jwt to support token based authentication 
+- TTYD for providing web interface of the given bash terminal ( for our case this is LXC)
+- A good SSD with nice throughput support for reading/writing related operations
+- proper folders permissions for creating UDS files on that path 
 
-according to following template 
-setup in following path `/etc/caddy/Caddyfile` 
+## Architecture
 
-change port under caddy configuration according to availablity on system and make sure nginx `proxy_pass` is also on same port 
+<p align="center">
+    <img src="./assest/caddy.drawio.svg" alt="Architecture diagram" />
+</p>
 
-also we can set custom JWT token, under below configuration file, provided we have same token set under `~/path_to_terminal_service/.env` file of rust lang 
+Figure: High-level architecture — Caddy (with caddy-jwt) routes HTTP to Unix domain sockets, forwarding to the terminal service (ttyd) that attaches to LXC containers; JWT in the request header provides authentication.
 
-```caddy
-:8082 {
-        # Set this path to your site's directory.
-        root * /usr/share/caddy
+## Installation
 
-        # Enable the static file server.
-        file_server
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/mizzle-infra-terminal.git
+cd mizzle-infra-terminal
 
-        # Another common task is to set up a reverse proxy:
-        # reverse_proxy localhost:8080
+# run program under the service file or someother 
+cargo r -r
 
-        # Or serve a PHP site through php-fpm:
-        # php_fastcgi localhost:9000
-        @sessionPath {
-                path_regexp session_id ^/([^/]+)
-        }
+# setup caddy binary for the config, you may run this as a service file 
+caddy run --config ./path/to/CaddyFile --caddyFile
 
-        route @sessionPath {
-
-                jwtauth {
-                        sign_key TkZMNSowQmMjOVU2RUB0bm1DJkU3U1VONkd3SGZMbVk=
-                        sign_alg HS256
-                        from_query access_token token
-                        from_header X-Api-Token
-                        from_cookies user_session
-                        user_claims aud uid user_id username login
-                        #user_claims aud
-                }
-
-                rewrite * /
-                reverse_proxy unix//tmp/sessions/{re.session_id.1}.sock
-        }
-
-        respond "Invalid route" 404
-}
 ```
 
-after setup is complete, setting it as a systemd service with name `caddy-tmux` service is required in order we can run this as a command as follows `caddy run --config /etc/caddy/Caddyfile` 
 
+## Contributing
 
-## 4. setup nginx routing configuration to caddy 
-add location routing for nginx according to following configuration within `mizzleterminal.mizzle.io` 
+Contributions are welcome! Please open issues or submit pull requests.
 
-NOTE: make sure nginx points to right interface and port for caddy service 
+## License
 
-```nginx
-    location /session/ {
-        # Rewrite the URL correctly
-        rewrite ^/session/(.*)$ /$1 break;
-
-        proxy_pass http://127.0.0.1:8082;  # Use localhost instead of 0.0.0.0
-
-        # WebSocket Support
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        # Additional Headers
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-```
-
-## 5. setting params for rust service
-essentialy all configuration can be set for rust under `.env` file where important ones are following
-
-
-`UNIX_SOCKET_FOLDER=/tmp/sessions/` path where you wihs to create socket files, make sure this is same set for caddy to point on that path
-
-`TTYD_SESSION_TIMEOUT=1800` auto stop all the process which are spawned using ttyd running no longer than 30 mins, note this param is in secs 
-
-some changes 
+This project is licensed under the MIT License.
