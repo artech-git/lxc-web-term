@@ -6,6 +6,7 @@ use axum::{
 use http_error_derive::HttpError;
 use serde::{Deserialize, Serialize};
 
+// Struct for the response of container binding
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ContainerBindingResponse {
     pub terminal_session_name: String,
@@ -14,6 +15,7 @@ pub struct ContainerBindingResponse {
     pub status: BindingStatus,
 }
 
+// Basic Error enum for handling the error responses from the handlers
 #[derive(Serialize, Deserialize, Debug, HttpError)]
 pub enum BindingStatus {
     Binding,
@@ -59,6 +61,9 @@ impl IntoResponse for ContainerBindingResponse {
     }
 }
 
+
+//TODO: work on supporting the claims fields
+
 // #[derive(Debug, Serialize, Deserialize)]
 // pub struct Claims {
 //     pub aud: String,
@@ -69,12 +74,12 @@ impl IntoResponse for ContainerBindingResponse {
 //     pub exp: u64,
 // }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Claims {
-    pub exp: u64,
-    pub jti: String,
-    pub sub: String,
-    pub iss: String,
-    pub aud: Vec<String>,
-    pub username: String,
-}
+// #[derive(Debug, Serialize, Deserialize)]
+// pub struct Claims {
+//     pub exp: u64,
+//     pub jti: String,
+//     pub sub: String,
+//     pub iss: String,
+//     pub aud: Vec<String>,
+//     pub username: String,
+// }

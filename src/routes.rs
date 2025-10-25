@@ -1,122 +1,68 @@
-use std::{process::Stdio, sync::Arc};
 
-use crate::obj::{BindingStatus, ContainerBindingResponse};
+use crate::{obj::{BindingStatus, ContainerBindingResponse}, utils::{child_process_handler, HandlerState, InstanceState}};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use dashmap::DashMap;
-use tokio::{process::Command, sync::watch::Sender};
+
+/*
+    Route for accepting the terminal based upon instance_id which we get from the user endpoint
+    State carries the global handlerState and instanceState hashmap references
+*/
 
 //parametrize the function to accept diff. confg. as per future requirement
 pub async fn open_terminal(
     Path(instance_id): Path<String>,
-    State((mut job_handle, session_handle)): State<(
-        Arc<DashMap<String, (String, Sender<()>, tokio::time::Instant)>>,
-        Arc<DashMap<String, String>>,
+    State((job_handle, session_handle)): State<(
+        HandlerState,
+        InstanceState,
     )>,
 ) -> impl IntoResponse {
     // apply checks for presence of container on system !
 
-    let is_sanitized = instance_id.chars().all(|c| c.is_alphanumeric());
-    let char_count = instance_id.chars().count();
-
-    //todo: ensure max string size is correct
-    if !is_sanitized || char_count < 6 || char_count > 20 {
-        println!("- instance ID check failed");
-        return Err(BindingStatus::Failed(
-            "Incorrect instance id: {instance_id}".to_string(),
-        ));
+    // perform checks against the endpoint instance_id input
+    if let Err(validate_err) = crate::utils::validate_instance(&instance_id).await {
+        println!("- instance validation failed: {validate_err}");
+        return Err(BindingStatus::Failed(validate_err));
     }
 
+    //check if session already exists for a given instance id
     if let Some(session_id) = session_handle.get(&instance_id) {
         println!("+ session already found");
         return Err(BindingStatus::SessionRunning(session_id.clone()));
     }
+   
     let uds_session_name = uuid::Uuid::new_v4().as_hyphenated().to_string();
 
-    //todo: check if files which are created has 660 permission or not
-    let session_path = format!("{}{}.sock", dotenv!("UNIX_SOCKET_FOLDER"), uds_session_name);
-
-    let args = vec![
-        "-O",
-        "-o",
-        "-a",
-        "-W",
-        "-i",
-        &session_path,
-        "lxc",
-        "exec",
-        &instance_id,
-        "--",
-        "sh",
-        "-c",
-        r#"/bin/bash"#,
-    ];
-
-    let ttyd_session = Command::new("ttyd")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
+    let ttyd_session = crate::utils::start_ttyd_process(&instance_id, &uds_session_name).await;
 
     match ttyd_session {
-        Ok(mut ttyd) => {
+        Ok(ttyd_process) => {
             println!("+ listening on domain socket: {uds_session_name}");
 
-            let (mut tx, mut recv) = tokio::sync::watch::channel(());
-
-            tokio::spawn(async move {
-                let ttyd_pid = ttyd.id();
-                tokio::select! {
-                    _ = ttyd.wait() => {
-                            // when bore finishes it must ensure that any associated ttyd task is also dropped
-
-                        // bore.kill().await;
-                    }
-
-                    _ = recv.changed() =>  {
-                        println!("- task shutdown req : ");
-
-                        match ttyd.kill().await {
-                            Ok(_) => {
-                                println!("+ process shutdown success: pid ttyd: {ttyd_pid:?}");
-                            }
-                            _ => {
-                                println!(" - process failed abruptly !");
-                            }
-                        }
-                        ()
-                    }
-                }
-                ()
-            });
+            let shutdown_signal = child_process_handler(ttyd_process).await;
 
             // update hashmaps for proper information
-            job_handle.insert(uds_session_name.clone(), (instance_id.clone(), tx, tokio::time::Instant::now()));
+            job_handle.insert(uds_session_name.clone(), (instance_id.clone(), shutdown_signal, tokio::time::Instant::now()));
             session_handle.insert(instance_id.clone(), uds_session_name.clone());
 
-            let mut domain = dotenv!("SERVING_NAME").to_string();
-            let mut main_path = dotenv!("MACHINE_ID").to_string();
-            if !main_path.is_empty() {
-                domain.push_str("/");
-            }
-            main_path.push_str(format!("/{}", uds_session_name).as_str());
-            domain.push_str(main_path.as_str());
-
             let jwt_secret = dotenv!("MZ_TERM_JWT_SINGING_SECRET"); 
-            println!("+ jwt secret: {jwt_secret}");
-            
             let jwt_timeout = dotenv!("MZ_TERM_JWT_TIMEOUT").parse::<u64>().unwrap_or(3600);
             
             match crate::utils::jwt_token_generator(jwt_timeout, jwt_secret) {
                 Ok(token) => {
+
+                    let domain = dotenv!("SERVING_NAME").to_string();
+                    let main_path = dotenv!("MACHINE_ID").to_string();
                     
-                    //add token header as part of domain!
-                    domain.push_str(format!("?token={}", token).as_str());
+                    // generate the domain over which ttyd web terminal can be accessed
+                    let domain = crate::utils::acquire_response_details(
+                        domain,
+                        main_path,
+                        uds_session_name.clone(),
+                        token.clone(),
+                    );
 
                     let container_binding_resp = ContainerBindingResponse {
                         terminal_session_name: uds_session_name,
@@ -132,47 +78,64 @@ pub async fn open_terminal(
                 }
             }
 
-
-
         }
-        Err(ttyd_err) => {
-            println!("- ttyd process failed to start: {ttyd_err}");
-            return Err(BindingStatus::Failed(format!(
-                "ttyd spawing error: {}",
-                ttyd_err.to_string()
-            )));
+        Err(binding_err) => {
+            println!("- ttyd process failed to start: {:?}", binding_err);
+            return Err(binding_err);
         }
     }
     unreachable!("unreachable code section")
 }
 
+
+/*
+    Route for closing the terminal session based upon session_id which we get from the user endpoint
+    State carries the global handlerState and instanceState hashmap references
+    
+    acquire the respective shutdown channel signal sender based upon the session_id if present
+*/
+
+// close terminal session handler
 pub async fn close_terminal(
     Path(session_id): Path<String>,
-    State((mut job_handle, session_handle)): State<(
-        Arc<DashMap<String, (String, Sender<()>, tokio::time::Instant)>>,
-        Arc<DashMap<String, String>>,
+    State((job_handle, session_handle)): State<(
+        HandlerState,
+        InstanceState,
     )>,
 ) -> impl IntoResponse {
+
+    //session id is basically the uds session name
+    // 1. If session id is present in the job_handle hashmap, acquire the shutdown sender channel and send the shutdown signal
     let resp = match job_handle.contains_key(&session_id) {
         true => {
+            // 2. attempt to remove the job from the hashmap
             if let Some((sess, handle)) = job_handle.remove(&session_id) {
-                if let Ok(val) = handle.1.send(()) {
+                
+                // 1.2.1 send the shutdown signal to the task handler
+                if let Ok(_) = handle.1.send(()) {
                     // cancel this running task
                     println!("+ dropped session: {sess}");
                     let instance_id = handle.0;
                     // once the task is dropped, remove the session from session_handle hashmap
                     session_handle.remove(&instance_id);
                     Response::new("+ successfully closed the terminal session".to_string())
+                
+                // 1.2.2 if sending shutdown signal fails, 
+                // we preserve the session details and let dashmap handle the cleanup on timeout
                 } else {
                     //session cancellation failed
                     println!("- failed to cancel the session: {sess}");
                     Response::new("- failed to cancel the session".to_string())
                 }
+
+            // 3 .if removal from hashmap fails, due to lock or contention
             } else {
                 println!("- failed to close session id");
                 Response::new("- job not found for session_key or already removed".to_string())
             }
         }
+
+        // session id not found in the hashmap, hence already closed or invalid session id
         false => {
             println!("- failed to find the task for a given session key");
             let mut resp = Response::new(format!("- task not found for session key"));
