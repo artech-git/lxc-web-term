@@ -32,7 +32,16 @@ pub async fn open_terminal(
         println!("+ session already found");
         return Err(BindingStatus::SessionRunning(session_id.clone()));
     }
-   
+
+    // ensure the container actually exists and is running before spawning ttyd
+    // (resolves the "check that the container exists and is running" TODO)
+    if !crate::utils::container_is_running(&instance_id).await {
+        println!("- container not found or not running: {instance_id}");
+        return Err(BindingStatus::Failed(format!(
+            "container `{instance_id}` not found or not running"
+        )));
+    }
+
     let uds_session_name = uuid::Uuid::new_v4().as_hyphenated().to_string();
 
     let ttyd_session = crate::utils::start_ttyd_process(&instance_id, &uds_session_name).await;

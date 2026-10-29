@@ -86,17 +86,68 @@ pub async fn handle_ttyd_process_timeout(
 }
 
 // perform instance params checks
-pub async fn validate_instance(instance_id: impl AsRef<str>) -> Result<(), String> { 
-    let is_sanitized = instance_id.as_ref().chars().all(|c| c.is_alphanumeric());
-    let char_count = instance_id.as_ref().chars().count();
+//
+// Container names follow LXC/LXD rules: 1..=63 characters, ASCII letters,
+// digits and hyphens, and may not start or end with a hyphen. Hyphens are
+// legal (the previous alphanumeric-only check wrongly rejected real container
+// names such as `my-container-01`), and the length ceiling is 63, not 20.
+pub async fn validate_instance(instance_id: impl AsRef<str>) -> Result<(), String> {
+    let id = instance_id.as_ref();
+    let char_count = id.chars().count();
 
-    //todo: ensure max string size is correct
-    if !is_sanitized || char_count < 6 || char_count > 20 {
+    let valid_chars = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let edges_ok = !id.starts_with('-') && !id.ends_with('-');
+
+    if char_count < 1 || char_count > 63 || !valid_chars || !edges_ok {
         println!("- instance ID check failed");
-        return Err(format!("Incorrect instance id: {}", instance_id.as_ref()));
+        return Err(format!("Incorrect instance id: {}", id));
     }
     Ok(())
-} 
+}
+
+// Confirm the container exists and is currently running before a session is
+// spawned for it. `lxc list <name>` matches by prefix, so the JSON output is
+// parsed and an exact name match with a RUNNING status is required.
+pub async fn container_is_running(instance_id: &str) -> bool {
+    let output = match Command::new("lxc")
+        .args(["list", instance_id, "--format", "json"])
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            println!("- failed to run `lxc list` for {instance_id}: {err}");
+            return false;
+        }
+    };
+
+    if !output.status.success() {
+        println!("- `lxc list` reported failure for {instance_id}");
+        return false;
+    }
+
+    let containers: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(err) => {
+            println!("- failed to parse `lxc list` output for {instance_id}: {err}");
+            return false;
+        }
+    };
+
+    containers
+        .as_array()
+        .map(|list| {
+            list.iter().any(|container| {
+                let name = container.get("name").and_then(|n| n.as_str());
+                let status = container.get("status").and_then(|s| s.as_str());
+                name == Some(instance_id)
+                    && status
+                        .map(|s| s.eq_ignore_ascii_case("running"))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
 
 // start the ttyd child process for connecting with LXC container
 pub async fn start_ttyd_process(
@@ -251,16 +302,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_instance() {
-        
+
+        // hyphens are legal and the length ceiling is 63 (not 20)
         let valid_instance = "instance123";
-        let invalid_instance = "inst@nc#123";   
-        let short_instance = "inst";
-        let long_instance = "instance12345678901234567890";
+        let valid_hyphenated = "my-container-01";
+        let valid_short = "a"; // a single character is a legal name
+        let valid_max = "a".repeat(63);
+
+        let invalid_symbols = "inst@nc#123";
+        let invalid_empty = "";
+        let invalid_too_long = "a".repeat(64);
+        let invalid_leading_hyphen = "-abc";
+        let invalid_trailing_hyphen = "abc-";
 
         assert!(validate_instance(valid_instance).await.is_ok());
-        assert!(validate_instance(invalid_instance).await.is_err());
-        assert!(validate_instance(short_instance).await.is_err());
-        assert!(validate_instance(long_instance).await.is_err());
+        assert!(validate_instance(valid_hyphenated).await.is_ok());
+        assert!(validate_instance(valid_short).await.is_ok());
+        assert!(validate_instance(valid_max.as_str()).await.is_ok());
+
+        assert!(validate_instance(invalid_symbols).await.is_err());
+        assert!(validate_instance(invalid_empty).await.is_err());
+        assert!(validate_instance(invalid_too_long.as_str()).await.is_err());
+        assert!(validate_instance(invalid_leading_hyphen).await.is_err());
+        assert!(validate_instance(invalid_trailing_hyphen).await.is_err());
     }
 
     #[tokio::test]
