@@ -118,6 +118,8 @@ pub async fn close_terminal(
                     let instance_id = handle.0;
                     // once the task is dropped, remove the session from session_handle hashmap
                     session_handle.remove(&instance_id);
+                    // remove the socket file on session end
+                    crate::utils::remove_socket(&session_id);
                     Response::new("+ successfully closed the terminal session".to_string())
                 
                 // 1.2.2 if sending shutdown signal fails, 
