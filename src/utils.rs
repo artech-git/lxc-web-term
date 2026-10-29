@@ -3,6 +3,7 @@ use std::{process::Stdio, sync::Arc};
 use dashmap::DashMap;
 use tokio::{io as tio, process::{Child as TokioChild, Command}, sync::watch::Sender, time::{self, Instant}};
 
+use crate::metrics::Metrics;
 use crate::obj::BindingStatus;
 
 // common type alias
@@ -35,10 +36,10 @@ pub async fn shutdown_signal() {
 
     tokio::select! {
         _ = ctrl_c => {
-            println!("+ Shutdown in recv: ");
+            tracing::info!("shutdown signal received (ctrl-c)");
         },
         _ = terminate => {
-            println!("+ Shutdown recv: ");
+            tracing::info!("shutdown signal received (terminate)");
         },
     }
 }
@@ -48,6 +49,7 @@ pub async fn handle_ttyd_process_timeout(
     duration: String,
     global_handle_state_clone: HandlerState,
     global_instance_state_clone: InstanceState,
+    metrics: Arc<Metrics>,
 ) {
 
         // set the timeout duration to be about 1 hour by default
@@ -70,13 +72,15 @@ pub async fn handle_ttyd_process_timeout(
                 if time_elasped < tokio_timeout_duration {
                     true
                 } else {
+                    // record the completed session's lifetime before tearing it down
+                    metrics.record_session_completed(time_elasped.as_secs());
                     // send signal to the task to terminate
                     if let Ok(_) = value.1.send(()) {
-                        println!("+ dropped session: {instance_id}");
+                        tracing::info!(%instance_id, "dropped session (timeout)");
                         global_instance_state_clone.remove(&value.0);
                         false
                     } else {
-                        println!("- failed to send signal to task: {instance_id}");
+                        tracing::warn!(%instance_id, "failed to send signal to task");
                         false
                     }
                 }
@@ -92,7 +96,7 @@ pub async fn validate_instance(instance_id: impl AsRef<str>) -> Result<(), Strin
 
     //todo: ensure max string size is correct
     if !is_sanitized || char_count < 6 || char_count > 20 {
-        println!("- instance ID check failed");
+        tracing::warn!(instance_id = %instance_id.as_ref(), "instance ID check failed");
         return Err(format!("Incorrect instance id: {}", instance_id.as_ref()));
     }
     Ok(())
@@ -159,14 +163,14 @@ pub async fn child_process_handler(
             }
             // if shutdown signal is recv, kill the process
             _ = recv.changed() =>  {
-                println!("- task shutdown req : ");
+                tracing::debug!("task shutdown requested");
 
                 match ttyd_process.kill().await {
                     Ok(_) => {
-                        println!("+ process shutdown success: pid ttyd: {ttyd_pid:?}");
+                        tracing::info!(pid = ?ttyd_pid, "ttyd process shutdown success");
                     }
                     _ => {
-                        println!(" - process failed abruptly !");
+                        tracing::warn!(pid = ?ttyd_pid, "ttyd process failed to shut down cleanly");
                     }
                 }
                 ()
@@ -288,6 +292,7 @@ mod tests {
             duration,
             global_handle_state.clone(),
             global_instance_state.clone(),
+            Arc::new(Metrics::default()),
         ));
 
         // Allow some time for the handler to run
@@ -324,6 +329,7 @@ mod tests {
             duration,
             global_handle_state.clone(),
             global_instance_state.clone(),
+            Arc::new(Metrics::default()),
         ));
 
         // Allow some time for the handler to run
