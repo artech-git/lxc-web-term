@@ -5,6 +5,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use dashmap::mapref::entry::Entry;
 
 /*
     Route for accepting the terminal based upon instance_id which we get from the user endpoint
@@ -27,13 +28,24 @@ pub async fn open_terminal(
         return Err(BindingStatus::Failed(validate_err));
     }
 
-    //check if session already exists for a given instance id
-    if let Some(session_id) = session_handle.get(&instance_id) {
-        println!("+ session already found");
-        return Err(BindingStatus::SessionRunning(session_id.clone()));
-    }
-   
-    let uds_session_name = uuid::Uuid::new_v4().as_hyphenated().to_string();
+    // Atomically check-and-reserve the instance slot via the DashMap entry API.
+    // The previous code did `get` then later `insert` as two separate steps, so
+    // two concurrent requests for the same instance could both pass the check and
+    // both spawn a ttyd process. Taking the entry holds the shard lock across the
+    // check and the reservation, so a concurrent request observes the slot as
+    // occupied and is rejected. The reservation is rolled back below if the spawn
+    // itself fails, so a failed start does not wedge the instance.
+    let uds_session_name = match session_handle.entry(instance_id.clone()) {
+        Entry::Occupied(existing) => {
+            println!("+ session already found");
+            return Err(BindingStatus::SessionRunning(existing.get().clone()));
+        }
+        Entry::Vacant(slot) => {
+            let uds = uuid::Uuid::new_v4().as_hyphenated().to_string();
+            slot.insert(uds.clone());
+            uds
+        }
+    };
 
     let ttyd_session = crate::utils::start_ttyd_process(&instance_id, &uds_session_name).await;
 
@@ -43,9 +55,9 @@ pub async fn open_terminal(
 
             let shutdown_signal = child_process_handler(ttyd_process).await;
 
-            // update hashmaps for proper information
+            // the session_handle slot was already reserved above via the entry
+            // API; only the job_handle entry remains to be recorded here
             job_handle.insert(uds_session_name.clone(), (instance_id.clone(), shutdown_signal, tokio::time::Instant::now()));
-            session_handle.insert(instance_id.clone(), uds_session_name.clone());
 
             let jwt_secret = dotenv!("MZ_TERM_JWT_SINGING_SECRET"); 
             let jwt_timeout = dotenv!("MZ_TERM_JWT_TIMEOUT").parse::<u64>().unwrap_or(3600);
@@ -80,6 +92,9 @@ pub async fn open_terminal(
 
         }
         Err(binding_err) => {
+            // roll back the reservation so a failed spawn doesn't leave the
+            // instance permanently marked as attached
+            session_handle.remove(&instance_id);
             println!("- ttyd process failed to start: {:?}", binding_err);
             return Err(binding_err);
         }
