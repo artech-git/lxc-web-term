@@ -60,16 +60,18 @@ pub async fn handle_ttyd_process_timeout(
 
             let current_time = tokio::time::Instant::now();
 
-            global_handle_state_clone.retain(|_, value| {
-                
+            global_handle_state_clone.retain(|session_id, value| {
+
                 let ttyd_task_starting_time = value.2;
                 let instance_id = value.0.clone();
-                
+
                 let time_elasped = current_time - ttyd_task_starting_time;
 
                 if time_elasped < tokio_timeout_duration {
                     true
                 } else {
+                    // session timed out: remove its socket file on session end
+                    remove_socket(session_id);
                     // send signal to the task to terminate
                     if let Ok(_) = value.1.send(()) {
                         println!("+ dropped session: {instance_id}");
@@ -98,6 +100,73 @@ pub async fn validate_instance(instance_id: impl AsRef<str>) -> Result<(), Strin
     Ok(())
 } 
 
+// Directory the ttyd unix domain sockets live in (always ends in `/`).
+//
+// Prefer the systemd-provided runtime directory ($RUNTIME_DIRECTORY, which
+// resolves to /run/<service> and is owned and cleaned up by systemd) over the
+// configured folder, which historically pointed at the world-writable /tmp.
+// $RUNTIME_DIRECTORY may hold several colon-separated paths; the first is used.
+pub fn socket_dir() -> String {
+    let dir = std::env::var("RUNTIME_DIRECTORY")
+        .ok()
+        .and_then(|value| value.split(':').next().map(|s| s.to_string()))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| dotenv!("UNIX_SOCKET_FOLDER").to_string());
+
+    if dir.ends_with('/') {
+        dir
+    } else {
+        format!("{dir}/")
+    }
+}
+
+// Absolute path of the socket file backing a given session name.
+pub fn socket_path(session_name: &str) -> String {
+    format!("{}{}.sock", socket_dir(), session_name)
+}
+
+// Remove a single session's socket file. A missing file is not an error, since
+// ttyd does not always unlink its socket on exit and the startup sweep may have
+// removed it already.
+pub fn remove_socket(session_name: &str) {
+    let path = socket_path(session_name);
+    match std::fs::remove_file(&path) {
+        Ok(_) => println!("+ removed socket: {path}"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => println!("- failed to remove socket {path}: {err}"),
+    }
+}
+
+// Ensure the socket directory exists and remove any stale `*.sock` files left
+// behind by a previous run (a crash, a container stop, or a ttyd self-exit).
+// Called once at startup so orphaned sockets never accumulate.
+pub fn sweep_stale_sockets() {
+    let dir = socket_dir();
+
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        println!("- failed to create socket dir {dir}: {err}");
+        return;
+    }
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            println!("- failed to read socket dir {dir}: {err}");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("sock") {
+            match std::fs::remove_file(&path) {
+                Ok(_) => println!("+ swept stale socket: {}", path.display()),
+                Err(err) => println!("- failed to sweep {}: {err}", path.display()),
+            }
+        }
+    }
+}
+
 // start the ttyd child process for connecting with LXC container
 pub async fn start_ttyd_process(
     instance_id: &str,
@@ -105,7 +174,7 @@ pub async fn start_ttyd_process(
 ) -> Result<TokioChild, BindingStatus> {
     // construct the unix socket path where TTYD will spawn the UDS path
      //todo: check if files which are created has 660 permission or not
-    let session_path = format!("{}{}.sock", dotenv!("UNIX_SOCKET_FOLDER"), uds_session_name);
+    let session_path = socket_path(uds_session_name);
 
     // arguments to spawn ttyd process with the required params
     let args = vec![

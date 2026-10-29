@@ -21,6 +21,10 @@ mod utils;
 async fn main() {
     dotenv::dotenv().ok();
 
+    // remove any sockets left behind by a previous run and make sure the
+    // (systemd runtime) socket directory exists before any session is spawned
+    utils::sweep_stale_sockets();
+
     let port = format!(
         "{}:{}",
         dotenv!("SERVER_INTERFACE_ADDR"),
