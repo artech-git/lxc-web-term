@@ -19,23 +19,45 @@ pub struct ContainerBindingResponse {
 #[derive(Serialize, Deserialize, Debug, HttpError)]
 pub enum BindingStatus {
     Binding,
+    #[http(code = 400, message = "Request failed")]
     Failed(String),
     Live,
+    #[http(code = 500, message = "Internal error")]
     Error(String),
     #[http(code = 500, message = "Error reading process value")]
     ProcessReadError(String),
-    #[http(code = 400, message = "Process already attached: url {0}")]
+    #[http(code = 409, message = "Session already attached for this instance")]
     SessionRunning(String),
+    #[http(code = 404, message = "Unknown session")]
+    NotFound(String),
+    #[http(code = 429, message = "At capacity: too many active sessions")]
+    AtCapacity,
     #[http(code = 500, message = "File creation error by ttyd")]
     FileCreationError(String),
 }
 
 impl IntoResponse for BindingStatus {
     fn into_response(self) -> Response<Body> {
-        let body = Body::new(self.http_message().unwrap_or("Some Error").to_string());
-        let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        resp
+        // Honor the status code annotated on each variant (via the HttpError
+        // derive's http_code()) instead of collapsing everything to 500.
+        let status = self
+            .http_code()
+            .and_then(|code| StatusCode::from_u16(code).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Prefer the dynamic detail a variant carries; fall back to its static
+        // annotated message for the unit variants.
+        let message = match &self {
+            BindingStatus::Failed(m)
+            | BindingStatus::Error(m)
+            | BindingStatus::ProcessReadError(m)
+            | BindingStatus::SessionRunning(m)
+            | BindingStatus::NotFound(m)
+            | BindingStatus::FileCreationError(m) => m.clone(),
+            _ => self.http_message().unwrap_or("Some Error").to_string(),
+        };
+
+        (status, message).into_response()
     }
 }
 
