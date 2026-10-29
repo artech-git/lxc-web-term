@@ -139,23 +139,45 @@ pub async fn start_ttyd_process(
     )))
 }
 
-// poll the child process on a another green thread on runtime and return the closing handle to it
+// poll the child process on a another green thread on runtime
+//
+// The spawned watcher task owns the lifecycle of the session: it registers the
+// session in the shared maps up-front and is the single place that removes those
+// entries again. Cleanup runs for BOTH exit paths:
+//   - the ttyd child exits on its own (user types `exit`, the browser refreshes
+//     and trips the `-O` once flag, or the container stops), and
+//   - an explicit shutdown signal (close endpoint / timeout sweep).
+// Previously the self-exit path left the map entries behind, so the instance was
+// reported as "already attached" until the absolute timeout swept it away.
 pub async fn child_process_handler(
-    mut ttyd_process: TokioChild
-) -> tokio::sync::watch::Sender<()> {
+    mut ttyd_process: TokioChild,
+    session_id: String,
+    instance_id: String,
+    global_handle_state: HandlerState,
+    global_instance_state: InstanceState,
+) {
     // setup a channel to send shutdown signal to the task
     let (tx, mut recv) = tokio::sync::watch::channel(());
 
+    // Register the session BEFORE spawning the watcher. Doing the insert here
+    // (rather than in the route handler after the task is spawned) guarantees the
+    // watcher's cleanup can never race ahead of the registration and leak an entry.
+    global_handle_state.insert(
+        session_id.clone(),
+        (instance_id.clone(), tx, Instant::now()),
+    );
+    global_instance_state.insert(instance_id.clone(), session_id.clone());
+
     //spawn this on the runtime where it gets polled continously for the updates
     tokio::spawn(async move {
-        
+
         let ttyd_pid = ttyd_process.id();
 
         // wait for either the process to end or a shutdown signal
         tokio::select! {
             // child process is required to be awaited here to avoid zombie processes
             _ = ttyd_process.wait() => {
-
+                println!("+ ttyd child exited on its own: session {session_id}");
             }
             // if shutdown signal is recv, kill the process
             _ = recv.changed() =>  {
@@ -169,13 +191,17 @@ pub async fn child_process_handler(
                         println!(" - process failed abruptly !");
                     }
                 }
-                ()
             }
         }
-        ()
-    });
 
-    tx
+        // The watcher owns cleanup: drop both map entries regardless of how the
+        // session ended. `remove` on an already-absent key is a harmless no-op, so
+        // this stays correct even when the close endpoint or timeout sweep removed
+        // the entry first.
+        global_handle_state.remove(&session_id);
+        global_instance_state.remove(&instance_id);
+        println!("+ cleaned up session maps: session {session_id}, instance {instance_id}");
+    });
 }
 
 pub fn acquire_response_details(

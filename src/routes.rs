@@ -41,11 +41,16 @@ pub async fn open_terminal(
         Ok(ttyd_process) => {
             println!("+ listening on domain socket: {uds_session_name}");
 
-            let shutdown_signal = child_process_handler(ttyd_process).await;
-
-            // update hashmaps for proper information
-            job_handle.insert(uds_session_name.clone(), (instance_id.clone(), shutdown_signal, tokio::time::Instant::now()));
-            session_handle.insert(instance_id.clone(), uds_session_name.clone());
+            // the watcher task registers the session in both maps and owns the
+            // cleanup when the session ends (self-exit or explicit shutdown).
+            child_process_handler(
+                ttyd_process,
+                uds_session_name.clone(),
+                instance_id.clone(),
+                job_handle.clone(),
+                session_handle.clone(),
+            )
+            .await;
 
             let jwt_secret = dotenv!("MZ_TERM_JWT_SINGING_SECRET"); 
             let jwt_timeout = dotenv!("MZ_TERM_JWT_TIMEOUT").parse::<u64>().unwrap_or(3600);
