@@ -1,16 +1,13 @@
-#[macro_use]
-extern crate dotenv_codegen;
-
-use core::time;
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
 use dashmap::DashMap;
-use tokio::{sync::watch::Sender, time::Instant};
 use utils::shutdown_signal;
 
+use crate::config::Config;
 use crate::utils::{HandlerState, InstanceState};
 
+mod config;
 mod obj;
 mod routes;
 mod utils;
@@ -21,11 +18,17 @@ mod utils;
 async fn main() {
     dotenv::dotenv().ok();
 
-    let port = format!(
-        "{}:{}",
-        dotenv!("SERVER_INTERFACE_ADDR"),
-        dotenv!("TERM_SERVER_PORT")
-    );
+    // Load configuration at runtime and fail fast on anything missing or
+    // malformed, rather than baking values into the binary at compile time.
+    let config = match Config::from_env() {
+        Ok(cfg) => Arc::new(cfg),
+        Err(err) => {
+            eprintln!("- invalid configuration: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let port = config.bind_address();
     println!("+ Server runnning on address: {port}");
 
     // Insert checks for presence for bore & ttyd !
@@ -68,13 +71,13 @@ async fn main() {
     let global_handle_state: HandlerState = Arc::new(DashMap::new());
 
     //clone rest of the handlers for passing to handlers
-    let duration = dotenv!("TTYD_SESSION_TIMEOUT").to_string();
+    let timeout_secs = config.ttyd_session_timeout;
     let global_instance_state_clone = global_instance_state.clone();
     let global_handle_state_clone = global_handle_state.clone();
 
     // spawn a task to handle ttyd process timeouts
     tokio::spawn(utils::handle_ttyd_process_timeout(
-            duration,
+            timeout_secs,
             global_handle_state_clone,
             global_instance_state_clone,
         )
@@ -85,10 +88,18 @@ async fn main() {
             "/start_web_session/{instance_uid}",
             get(routes::open_terminal),
         )
-        .with_state((global_handle_state.clone(), global_instance_state.clone()));
+        .with_state((
+            global_handle_state.clone(),
+            global_instance_state.clone(),
+            config.clone(),
+        ));
     let route_2 = Router::new()
         .route("/terminate_web_session/{uid}", get(routes::close_terminal))
-        .with_state((global_handle_state.clone(), global_instance_state.clone()));
+        .with_state((
+            global_handle_state.clone(),
+            global_instance_state.clone(),
+            config.clone(),
+        ));
 
     let app = Router::new().merge(route_1).merge(route_2);
 
