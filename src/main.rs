@@ -90,7 +90,12 @@ async fn main() {
         .route("/terminate_web_session/{uid}", get(routes::close_terminal))
         .with_state((global_handle_state.clone(), global_instance_state.clone()));
 
-    let app = Router::new().merge(route_1).merge(route_2);
+    // heartbeat endpoint to extend an active session's idle deadline
+    let route_3 = Router::new()
+        .route("/extend_web_session/{session_id}", get(routes::extend_terminal))
+        .with_state((global_handle_state.clone(), global_instance_state.clone()));
+
+    let app = Router::new().merge(route_1).merge(route_2).merge(route_3);
 
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 

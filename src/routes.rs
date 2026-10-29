@@ -89,9 +89,46 @@ pub async fn open_terminal(
 
 
 /*
+    Route for extending (resetting the idle deadline of) a live terminal session.
+
+    The idle-timeout sweep measures inactivity from the last-activity Instant
+    stored for each session. A client keeps an actively used shell alive by
+    calling this endpoint as a heartbeat; each call resets that Instant to now,
+    so only genuinely idle sessions are reaped.
+*/
+pub async fn extend_terminal(
+    Path(session_id): Path<String>,
+    State((job_handle, _session_handle)): State<(
+        HandlerState,
+        InstanceState,
+    )>,
+) -> impl IntoResponse {
+    // session id is the uds session name, i.e. the key of the job handle map
+    match job_handle.get_mut(&session_id) {
+        Some(mut entry) => {
+            // refresh the last-activity timestamp, pushing the idle deadline out
+            entry.2 = tokio::time::Instant::now();
+            println!("+ extended session: {session_id}");
+            (
+                StatusCode::OK,
+                format!("+ session extended: {session_id}"),
+            )
+        }
+        None => {
+            println!("- extend failed, unknown session: {session_id}");
+            (
+                StatusCode::NOT_FOUND,
+                format!("- unknown session: {session_id}"),
+            )
+        }
+    }
+}
+
+
+/*
     Route for closing the terminal session based upon session_id which we get from the user endpoint
     State carries the global handlerState and instanceState hashmap references
-    
+
     acquire the respective shutdown channel signal sender based upon the session_id if present
 */
 
