@@ -1,5 +1,7 @@
 
-use crate::{obj::{BindingStatus, ContainerBindingResponse}, utils::{child_process_handler, HandlerState, InstanceState}};
+use std::sync::Arc;
+
+use crate::{config::Config, obj::{BindingStatus, ContainerBindingResponse}, utils::{child_process_handler, HandlerState, InstanceState}};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -14,9 +16,10 @@ use axum::{
 //parametrize the function to accept diff. confg. as per future requirement
 pub async fn open_terminal(
     Path(instance_id): Path<String>,
-    State((job_handle, session_handle)): State<(
+    State((job_handle, session_handle, config)): State<(
         HandlerState,
         InstanceState,
+        Arc<Config>,
     )>,
 ) -> impl IntoResponse {
     // apply checks for presence of container on system !
@@ -35,7 +38,12 @@ pub async fn open_terminal(
    
     let uds_session_name = uuid::Uuid::new_v4().as_hyphenated().to_string();
 
-    let ttyd_session = crate::utils::start_ttyd_process(&instance_id, &uds_session_name).await;
+    let ttyd_session = crate::utils::start_ttyd_process(
+        &instance_id,
+        &uds_session_name,
+        &config.unix_socket_folder,
+    )
+    .await;
 
     match ttyd_session {
         Ok(ttyd_process) => {
@@ -47,14 +55,14 @@ pub async fn open_terminal(
             job_handle.insert(uds_session_name.clone(), (instance_id.clone(), shutdown_signal, tokio::time::Instant::now()));
             session_handle.insert(instance_id.clone(), uds_session_name.clone());
 
-            let jwt_secret = dotenv!("MZ_TERM_JWT_SINGING_SECRET"); 
-            let jwt_timeout = dotenv!("MZ_TERM_JWT_TIMEOUT").parse::<u64>().unwrap_or(3600);
-            
+            let jwt_secret = config.jwt_signing_secret.as_str();
+            let jwt_timeout = config.jwt_timeout;
+
             match crate::utils::jwt_token_generator(jwt_timeout, jwt_secret) {
                 Ok(token) => {
 
-                    let domain = dotenv!("SERVING_NAME").to_string();
-                    let main_path = dotenv!("MACHINE_ID").to_string();
+                    let domain = config.serving_name.clone();
+                    let main_path = config.machine_id.clone();
                     
                     // generate the domain over which ttyd web terminal can be accessed
                     let domain = crate::utils::acquire_response_details(
@@ -98,9 +106,10 @@ pub async fn open_terminal(
 // close terminal session handler
 pub async fn close_terminal(
     Path(session_id): Path<String>,
-    State((job_handle, session_handle)): State<(
+    State((job_handle, session_handle, _config)): State<(
         HandlerState,
         InstanceState,
+        Arc<Config>,
     )>,
 ) -> impl IntoResponse {
 

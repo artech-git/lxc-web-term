@@ -45,14 +45,14 @@ pub async fn shutdown_signal() {
 
 // handle ttyd child process timeouts in the subcommands 
 pub async fn handle_ttyd_process_timeout(
-    duration: String,
+    timeout_secs: u64,
     global_handle_state_clone: HandlerState,
     global_instance_state_clone: InstanceState,
 ) {
 
-        // set the timeout duration to be about 1 hour by default
-        let timeout_duration = duration.parse::<u64>().unwrap_or(3600);
-        let tokio_timeout_duration = time::Duration::from_secs(timeout_duration);
+        // the timeout is validated at startup (Config), so it is used as-is here
+        // rather than being re-parsed with a silent fallback default
+        let tokio_timeout_duration = time::Duration::from_secs(timeout_secs);
 
         loop {
             // give some 5 secs pause for the next iteration
@@ -102,10 +102,11 @@ pub async fn validate_instance(instance_id: impl AsRef<str>) -> Result<(), Strin
 pub async fn start_ttyd_process(
     instance_id: &str,
     uds_session_name: &str,
+    socket_folder: &str,
 ) -> Result<TokioChild, BindingStatus> {
     // construct the unix socket path where TTYD will spawn the UDS path
      //todo: check if files which are created has 660 permission or not
-    let session_path = format!("{}{}.sock", dotenv!("UNIX_SOCKET_FOLDER"), uds_session_name);
+    let session_path = format!("{}{}.sock", socket_folder, uds_session_name);
 
     // arguments to spawn ttyd process with the required params
     let args = vec![
@@ -266,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn handle_ttyd_process_timeout_test_one() {
         // test for 10 second timeout
-        let duration = "3".to_string(); // 10 seconds for testing
+        let duration: u64 = 3; // 10 seconds for testing
 
         let global_handle_state: HandlerState = Arc::new(DashMap::new());
         let global_instance_state: InstanceState = Arc::new(DashMap::new());
@@ -302,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn handle_ttyd_process_timeout_test_two() {
         // test for 10 second timeout
-        let duration = "10".to_string(); // 10 seconds for testing
+        let duration: u64 = 10; // 10 seconds for testing
 
         let global_handle_state: HandlerState = Arc::new(DashMap::new());
         let global_instance_state: InstanceState = Arc::new(DashMap::new());
@@ -340,7 +341,7 @@ mod tests {
         let instance_id = "test_instance";
         let uds_session_name = "test_session";
 
-        let result = start_ttyd_process(instance_id, uds_session_name).await;
+        let result = start_ttyd_process(instance_id, uds_session_name, "/tmp/sessions/").await;
 
         // Since ttyd might not be installed in the test environment, we check for error
         assert!(result.is_err() || result.is_ok());

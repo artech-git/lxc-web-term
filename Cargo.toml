@@ -7,7 +7,6 @@ edition = "2021"
 axum = { version = "0.8.1", features = ["macros"] }
 dashmap = "6.1.0"
 dotenv = { version = "0.15.0", features = ["cli"] }
-dotenv_codegen = "0.15.0"
 futures = "0.3.31"
 http-error-derive = "0.3.2"
 jsonwebtoken = "9.3.1"
