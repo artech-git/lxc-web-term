@@ -108,6 +108,10 @@ pub async fn start_ttyd_process(
     let session_path = format!("{}{}.sock", dotenv!("UNIX_SOCKET_FOLDER"), uds_session_name);
 
     // arguments to spawn ttyd process with the required params
+    //
+    // The interactive shell is chosen inside the container at runtime: prefer
+    // bash when it is available, otherwise fall back to sh. Hard-coding
+    // `/bin/bash` broke on images that ship only sh (e.g. Alpine).
     let args = vec![
         "-O",
         "-o",
@@ -121,7 +125,7 @@ pub async fn start_ttyd_process(
         "--",
         "sh",
         "-c",
-        r#"/bin/bash"#,
+        r#"if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"#,
     ];
 
     // spawn the ttyd process, return the child process handle, ensuring stdin is null and stdout/stderr are piped and killed on drop
