@@ -43,7 +43,14 @@ pub async fn shutdown_signal() {
     }
 }
 
-// handle ttyd child process timeouts in the subcommands 
+// Reap ttyd sessions that have been IDLE for longer than the timeout.
+//
+// The timeout is an *idle* timeout, not an absolute one: each session carries a
+// "last activity" Instant (value.2) that is refreshed by the extend endpoint
+// (see `routes::extend_terminal`). A session is reaped only once it has gone
+// `duration` seconds without being extended, so an actively used shell that
+// heartbeats stays alive indefinitely instead of being killed at a fixed
+// deadline measured from when it started.
 pub async fn handle_ttyd_process_timeout(
     duration: String,
     global_handle_state_clone: HandlerState,
@@ -61,11 +68,12 @@ pub async fn handle_ttyd_process_timeout(
             let current_time = tokio::time::Instant::now();
 
             global_handle_state_clone.retain(|_, value| {
-                
-                let ttyd_task_starting_time = value.2;
+
+                // value.2 is the last-activity Instant, refreshed on every extend
+                let last_activity = value.2;
                 let instance_id = value.0.clone();
-                
-                let time_elasped = current_time - ttyd_task_starting_time;
+
+                let time_elasped = current_time - last_activity;
 
                 if time_elasped < tokio_timeout_duration {
                     true
