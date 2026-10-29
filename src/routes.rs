@@ -11,6 +11,39 @@ use axum::{
     State carries the global handlerState and instanceState hashmap references
 */
 
+// Upper bound on concurrently attached sessions; past this, start returns 429.
+const MAX_CONCURRENT_SESSIONS: usize = 100;
+
+// Build the success response (JWT token + access URL) for a given session name.
+// Shared by the fresh-start and idempotent paths so both return an identical url.
+fn build_session_response(
+    uds_session_name: String,
+) -> Result<ContainerBindingResponse, BindingStatus> {
+    let jwt_secret = dotenv!("MZ_TERM_JWT_SINGING_SECRET");
+    let jwt_timeout = dotenv!("MZ_TERM_JWT_TIMEOUT").parse::<u64>().unwrap_or(3600);
+
+    let token = crate::utils::jwt_token_generator(jwt_timeout, jwt_secret)
+        .map_err(|_| BindingStatus::Error("JWT token generation failed".to_string()))?;
+
+    let domain = dotenv!("SERVING_NAME").to_string();
+    let main_path = dotenv!("MACHINE_ID").to_string();
+
+    // generate the domain over which ttyd web terminal can be accessed
+    let url = crate::utils::acquire_response_details(
+        domain,
+        main_path,
+        uds_session_name.clone(),
+        token.clone(),
+    );
+
+    Ok(ContainerBindingResponse {
+        terminal_session_name: uds_session_name,
+        access_token: token,
+        url,
+        status: BindingStatus::Live,
+    })
+}
+
 //parametrize the function to accept diff. confg. as per future requirement
 pub async fn open_terminal(
     Path(instance_id): Path<String>,
@@ -27,12 +60,21 @@ pub async fn open_terminal(
         return Err(BindingStatus::Failed(validate_err));
     }
 
-    //check if session already exists for a given instance id
-    if let Some(session_id) = session_handle.get(&instance_id) {
-        println!("+ session already found");
-        return Err(BindingStatus::SessionRunning(session_id.clone()));
+    // Idempotent start: if a session already exists for this instance, return the
+    // existing session's URL (200) instead of erroring. Repeated starts for the
+    // same instance are therefore safe and return the same attachment.
+    if let Some(existing) = session_handle.get(&instance_id) {
+        let uds_session_name = existing.clone();
+        println!("+ session already found, returning existing url");
+        return build_session_response(uds_session_name);
     }
-   
+
+    // Capacity guard: reject new sessions past the configured ceiling with 429.
+    if session_handle.len() >= MAX_CONCURRENT_SESSIONS {
+        println!("- at capacity, rejecting start for {instance_id}");
+        return Err(BindingStatus::AtCapacity);
+    }
+
     let uds_session_name = uuid::Uuid::new_v4().as_hyphenated().to_string();
 
     let ttyd_session = crate::utils::start_ttyd_process(&instance_id, &uds_session_name).await;
@@ -47,44 +89,13 @@ pub async fn open_terminal(
             job_handle.insert(uds_session_name.clone(), (instance_id.clone(), shutdown_signal, tokio::time::Instant::now()));
             session_handle.insert(instance_id.clone(), uds_session_name.clone());
 
-            let jwt_secret = dotenv!("MZ_TERM_JWT_SINGING_SECRET"); 
-            let jwt_timeout = dotenv!("MZ_TERM_JWT_TIMEOUT").parse::<u64>().unwrap_or(3600);
-            
-            match crate::utils::jwt_token_generator(jwt_timeout, jwt_secret) {
-                Ok(token) => {
-
-                    let domain = dotenv!("SERVING_NAME").to_string();
-                    let main_path = dotenv!("MACHINE_ID").to_string();
-                    
-                    // generate the domain over which ttyd web terminal can be accessed
-                    let domain = crate::utils::acquire_response_details(
-                        domain,
-                        main_path,
-                        uds_session_name.clone(),
-                        token.clone(),
-                    );
-
-                    let container_binding_resp = ContainerBindingResponse {
-                        terminal_session_name: uds_session_name,
-                        access_token: token,
-                        url: domain,
-                        status: BindingStatus::Live,
-                    };
-
-                    return Ok(container_binding_resp);
-                }
-                Err(_) => {
-                    return Err(BindingStatus::Error("JWT token generation failed".to_string()));
-                }
-            }
-
+            build_session_response(uds_session_name)
         }
         Err(binding_err) => {
             println!("- ttyd process failed to start: {:?}", binding_err);
-            return Err(binding_err);
+            Err(binding_err)
         }
     }
-    unreachable!("unreachable code section")
 }
 
 
@@ -139,7 +150,7 @@ pub async fn close_terminal(
         false => {
             println!("- failed to find the task for a given session key");
             let mut resp = Response::new(format!("- task not found for session key"));
-            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            *resp.status_mut() = StatusCode::NOT_FOUND;
             resp
         }
     };
