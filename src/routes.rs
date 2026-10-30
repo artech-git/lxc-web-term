@@ -1,106 +1,185 @@
 
-use crate::{obj::{BindingStatus, ContainerBindingResponse}, utils::{child_process_handler, HandlerState, InstanceState}};
+use std::sync::Arc;
+
+use crate::{
+    config::Config,
+    metrics::Metrics,
+    obj::{BindingStatus, ContainerBindingResponse},
+    utils::{child_process_handler, HandlerState, InstanceState},
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use dashmap::mapref::entry::Entry;
+
+// Upper bound on concurrently attached sessions; past this, start returns 429.
+const MAX_CONCURRENT_SESSIONS: usize = 100;
+
+// Build the success response (JWT token + access URL) for a given session name.
+// Shared by the fresh-start and idempotent paths so both return an identical url.
+fn build_session_response(
+    uds_session_name: String,
+    config: &Config,
+) -> Result<ContainerBindingResponse, BindingStatus> {
+    let token = crate::utils::jwt_token_generator(config.jwt_timeout, &config.jwt_signing_secret)
+        .map_err(|_| BindingStatus::Error("JWT token generation failed".to_string()))?;
+
+    // generate the domain over which ttyd web terminal can be accessed
+    let url = crate::utils::acquire_response_details(
+        config.serving_name.clone(),
+        config.machine_id.clone(),
+        uds_session_name.clone(),
+        token.clone(),
+    );
+
+    Ok(ContainerBindingResponse {
+        terminal_session_name: uds_session_name,
+        access_token: token,
+        url,
+        status: BindingStatus::Live,
+    })
+}
 
 /*
     Route for accepting the terminal based upon instance_id which we get from the user endpoint
-    State carries the global handlerState and instanceState hashmap references
+    State carries the global handlerState, instanceState, runtime Config and Metrics references
 */
 
 //parametrize the function to accept diff. confg. as per future requirement
 pub async fn open_terminal(
     Path(instance_id): Path<String>,
-    State((job_handle, session_handle)): State<(
+    State((job_handle, session_handle, config, metrics)): State<(
         HandlerState,
         InstanceState,
+        Arc<Config>,
+        Arc<Metrics>,
     )>,
 ) -> impl IntoResponse {
-    // apply checks for presence of container on system !
-
     // perform checks against the endpoint instance_id input
     if let Err(validate_err) = crate::utils::validate_instance(&instance_id).await {
-        println!("- instance validation failed: {validate_err}");
+        tracing::warn!(%instance_id, error = %validate_err, "instance validation failed");
         return Err(BindingStatus::Failed(validate_err));
     }
 
-    //check if session already exists for a given instance id
-    if let Some(session_id) = session_handle.get(&instance_id) {
-        println!("+ session already found");
-        return Err(BindingStatus::SessionRunning(session_id.clone()));
+    // Idempotent start: if a session already exists for this instance, return the
+    // existing session's URL (200) instead of erroring. This happens before the
+    // capacity check so an already-attached instance is served even at capacity.
+    if let Some(existing) = session_handle.get(&instance_id) {
+        let uds_session_name = existing.clone();
+        tracing::info!(%instance_id, "session already found, returning existing url");
+        return build_session_response(uds_session_name, &config);
     }
-   
-    let uds_session_name = uuid::Uuid::new_v4().as_hyphenated().to_string();
 
-    let ttyd_session = crate::utils::start_ttyd_process(&instance_id, &uds_session_name).await;
+    // Capacity guard: reject new sessions past the configured ceiling with 429.
+    if session_handle.len() >= MAX_CONCURRENT_SESSIONS {
+        tracing::warn!(%instance_id, "at capacity, rejecting start");
+        return Err(BindingStatus::AtCapacity);
+    }
+
+    // ensure the container actually exists and is running before spawning ttyd
+    if !crate::utils::container_is_running(&instance_id).await {
+        tracing::warn!(%instance_id, "container not found or not running");
+        return Err(BindingStatus::Failed(format!(
+            "container `{instance_id}` not found or not running"
+        )));
+    }
+
+    // Atomically check-and-reserve the instance slot via the DashMap entry API,
+    // closing the check-then-insert race (two concurrent starts for the same
+    // instance can no longer both spawn). An Occupied entry means another request
+    // reserved the slot in the window above, so return that session idempotently.
+    let uds_session_name = match session_handle.entry(instance_id.clone()) {
+        Entry::Occupied(existing) => {
+            tracing::info!(%instance_id, "session already found, returning existing url");
+            return build_session_response(existing.get().clone(), &config);
+        }
+        Entry::Vacant(slot) => {
+            let uds = uuid::Uuid::new_v4().as_hyphenated().to_string();
+            slot.insert(uds.clone());
+            uds
+        }
+    };
+
+    let ttyd_session = crate::utils::start_ttyd_process(
+        &instance_id,
+        &uds_session_name,
+        &config.unix_socket_folder,
+    )
+    .await;
 
     match ttyd_session {
         Ok(ttyd_process) => {
-            println!("+ listening on domain socket: {uds_session_name}");
+            tracing::info!(%uds_session_name, %instance_id, "listening on domain socket");
 
-            let shutdown_signal = child_process_handler(ttyd_process).await;
+            // the watcher task records the session in both maps and owns cleanup
+            // (maps + socket) when the session ends, for either exit path
+            child_process_handler(
+                ttyd_process,
+                uds_session_name.clone(),
+                instance_id.clone(),
+                job_handle.clone(),
+                session_handle.clone(),
+                config.unix_socket_folder.clone(),
+            )
+            .await;
 
-            // update hashmaps for proper information
-            job_handle.insert(uds_session_name.clone(), (instance_id.clone(), shutdown_signal, tokio::time::Instant::now()));
-            session_handle.insert(instance_id.clone(), uds_session_name.clone());
-
-            let jwt_secret = dotenv!("MZ_TERM_JWT_SINGING_SECRET"); 
-            let jwt_timeout = dotenv!("MZ_TERM_JWT_TIMEOUT").parse::<u64>().unwrap_or(3600);
-            
-            match crate::utils::jwt_token_generator(jwt_timeout, jwt_secret) {
-                Ok(token) => {
-
-                    let domain = dotenv!("SERVING_NAME").to_string();
-                    let main_path = dotenv!("MACHINE_ID").to_string();
-                    
-                    // generate the domain over which ttyd web terminal can be accessed
-                    let domain = crate::utils::acquire_response_details(
-                        domain,
-                        main_path,
-                        uds_session_name.clone(),
-                        token.clone(),
-                    );
-
-                    let container_binding_resp = ContainerBindingResponse {
-                        terminal_session_name: uds_session_name,
-                        access_token: token,
-                        url: domain,
-                        status: BindingStatus::Live,
-                    };
-
-                    return Ok(container_binding_resp);
-                }
-                Err(_) => {
-                    return Err(BindingStatus::Error("JWT token generation failed".to_string()));
-                }
-            }
-
+            metrics.record_session_started();
+            build_session_response(uds_session_name, &config)
         }
         Err(binding_err) => {
-            println!("- ttyd process failed to start: {:?}", binding_err);
-            return Err(binding_err);
+            // roll back the reservation so a failed spawn doesn't wedge the instance
+            session_handle.remove(&instance_id);
+            metrics.record_spawn_failure();
+            tracing::error!(%instance_id, error = ?binding_err, "ttyd process failed to start");
+            Err(binding_err)
         }
     }
-    unreachable!("unreachable code section")
 }
 
+/*
+    Route for extending (resetting the idle deadline of) a live terminal session.
+
+    The idle-timeout sweep measures inactivity from the last-activity Instant
+    stored for each session. A client keeps an actively used shell alive by
+    calling this endpoint as a heartbeat; each call resets that Instant to now,
+    so only genuinely idle sessions are reaped.
+*/
+pub async fn extend_terminal(
+    Path(session_id): Path<String>,
+    State(job_handle): State<HandlerState>,
+) -> impl IntoResponse {
+    // session id is the uds session name, i.e. the key of the job handle map
+    match job_handle.get_mut(&session_id) {
+        Some(mut entry) => {
+            // refresh the last-activity timestamp, pushing the idle deadline out
+            entry.2 = tokio::time::Instant::now();
+            tracing::info!(session = %session_id, "extended session");
+            (StatusCode::OK, format!("+ session extended: {session_id}"))
+        }
+        None => {
+            tracing::warn!(session = %session_id, "extend failed, unknown session");
+            (StatusCode::NOT_FOUND, format!("- unknown session: {session_id}"))
+        }
+    }
+}
 
 /*
     Route for closing the terminal session based upon session_id which we get from the user endpoint
-    State carries the global handlerState and instanceState hashmap references
-    
+    State carries the global handlerState, instanceState, Config and Metrics references
+
     acquire the respective shutdown channel signal sender based upon the session_id if present
 */
 
 // close terminal session handler
 pub async fn close_terminal(
     Path(session_id): Path<String>,
-    State((job_handle, session_handle)): State<(
+    State((job_handle, session_handle, config, metrics)): State<(
         HandlerState,
         InstanceState,
+        Arc<Config>,
+        Arc<Metrics>,
     )>,
 ) -> impl IntoResponse {
 
@@ -110,39 +189,87 @@ pub async fn close_terminal(
         true => {
             // 2. attempt to remove the job from the hashmap
             if let Some((sess, handle)) = job_handle.remove(&session_id) {
-                
+
+                // session lifetime, measured from the stored start Instant
+                let started_at = handle.2;
+
                 // 1.2.1 send the shutdown signal to the task handler
-                if let Ok(_) = handle.1.send(()) {
+                if handle.1.send(()).is_ok() {
                     // cancel this running task
-                    println!("+ dropped session: {sess}");
+                    tracing::info!(session = %sess, "dropped session (closed)");
                     let instance_id = handle.0;
                     // once the task is dropped, remove the session from session_handle hashmap
                     session_handle.remove(&instance_id);
+                    // remove the socket file on session end
+                    crate::utils::remove_socket(&config.unix_socket_folder, &session_id);
+                    // record the completed session's lifetime
+                    let duration =
+                        tokio::time::Instant::now().saturating_duration_since(started_at);
+                    metrics.record_session_completed(duration.as_secs());
                     Response::new("+ successfully closed the terminal session".to_string())
-                
-                // 1.2.2 if sending shutdown signal fails, 
+
+                // 1.2.2 if sending shutdown signal fails,
                 // we preserve the session details and let dashmap handle the cleanup on timeout
                 } else {
                     //session cancellation failed
-                    println!("- failed to cancel the session: {sess}");
+                    tracing::warn!(session = %sess, "failed to cancel the session");
                     Response::new("- failed to cancel the session".to_string())
                 }
 
             // 3 .if removal from hashmap fails, due to lock or contention
             } else {
-                println!("- failed to close session id");
+                tracing::warn!(session = %session_id, "failed to close session id");
                 Response::new("- job not found for session_key or already removed".to_string())
             }
         }
 
         // session id not found in the hashmap, hence already closed or invalid session id
         false => {
-            println!("- failed to find the task for a given session key");
+            tracing::warn!(session = %session_id, "task not found for session key");
             let mut resp = Response::new(format!("- task not found for session key"));
-            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            *resp.status_mut() = StatusCode::NOT_FOUND;
             resp
         }
     };
 
     return resp;
+}
+
+/*
+    Liveness endpoint. Returns 200 with a small JSON body; used by load
+    balancers / orchestrators to check the service is up.
+*/
+pub async fn health() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("Content-Type", "application/json")],
+        r#"{"status":"ok"}"#,
+    )
+}
+
+/*
+    Metrics endpoint. Exposes active session count (read live from the session
+    map so it never drifts), total sessions started, ttyd spawn failures, and
+    completed-session count / average duration.
+*/
+pub async fn metrics(
+    State((job_handle, metrics)): State<(HandlerState, Arc<Metrics>)>,
+) -> impl IntoResponse {
+    let snapshot = metrics.snapshot(job_handle.len() as u64);
+    match serde_json::to_string(&snapshot) {
+        Ok(body) => (
+            StatusCode::OK,
+            [("Content-Type", "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to serialize metrics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "metrics serialization failed",
+            )
+                .into_response()
+        }
+    }
 }
