@@ -57,6 +57,21 @@ pub async fn open_terminal(
         Arc<Metrics>,
     )>,
 ) -> impl IntoResponse {
+    start_session(instance_id, job_handle, session_handle, config, metrics).await
+}
+
+/// Provision (or idempotently return) a terminal session for an instance.
+///
+/// Extracted from the HTTP handler so the control socket (`lwt sessions open`)
+/// can drive exactly the same path: validation, capacity guard, running-check,
+/// atomic slot reservation, ttyd spawn and bookkeeping.
+pub async fn start_session(
+    instance_id: String,
+    job_handle: HandlerState,
+    session_handle: InstanceState,
+    config: Arc<Config>,
+    metrics: Arc<Metrics>,
+) -> Result<ContainerBindingResponse, BindingStatus> {
     // perform checks against the endpoint instance_id input
     if let Err(validate_err) = crate::utils::validate_instance(&instance_id).await {
         tracing::warn!(%instance_id, error = %validate_err, "instance validation failed");
@@ -182,57 +197,73 @@ pub async fn close_terminal(
         Arc<Metrics>,
     )>,
 ) -> impl IntoResponse {
-
-    //session id is basically the uds session name
-    // 1. If session id is present in the job_handle hashmap, acquire the shutdown sender channel and send the shutdown signal
-    let resp = match job_handle.contains_key(&session_id) {
-        true => {
-            // 2. attempt to remove the job from the hashmap
-            if let Some((sess, handle)) = job_handle.remove(&session_id) {
-
-                // session lifetime, measured from the stored start Instant
-                let started_at = handle.2;
-
-                // 1.2.1 send the shutdown signal to the task handler
-                if handle.1.send(()).is_ok() {
-                    // cancel this running task
-                    tracing::info!(session = %sess, "dropped session (closed)");
-                    let instance_id = handle.0;
-                    // once the task is dropped, remove the session from session_handle hashmap
-                    session_handle.remove(&instance_id);
-                    // remove the socket file on session end
-                    crate::utils::remove_socket(&config.unix_socket_folder, &session_id);
-                    // record the completed session's lifetime
-                    let duration =
-                        tokio::time::Instant::now().saturating_duration_since(started_at);
-                    metrics.record_session_completed(duration.as_secs());
-                    Response::new("+ successfully closed the terminal session".to_string())
-
-                // 1.2.2 if sending shutdown signal fails,
-                // we preserve the session details and let dashmap handle the cleanup on timeout
-                } else {
-                    //session cancellation failed
-                    tracing::warn!(session = %sess, "failed to cancel the session");
-                    Response::new("- failed to cancel the session".to_string())
-                }
-
-            // 3 .if removal from hashmap fails, due to lock or contention
-            } else {
-                tracing::warn!(session = %session_id, "failed to close session id");
-                Response::new("- job not found for session_key or already removed".to_string())
-            }
-        }
-
-        // session id not found in the hashmap, hence already closed or invalid session id
-        false => {
-            tracing::warn!(session = %session_id, "task not found for session key");
-            let mut resp = Response::new(format!("- task not found for session key"));
+    match terminate_session(session_id, job_handle, session_handle, config, metrics).await {
+        Ok(message) => Response::new(message),
+        Err(TerminateError::NotFound) => {
+            let mut resp = Response::new("- task not found for session key".to_string());
             *resp.status_mut() = StatusCode::NOT_FOUND;
             resp
         }
+        Err(TerminateError::Failed(message)) => Response::new(message),
+    }
+}
+
+/// Why terminating a session did not complete.
+pub enum TerminateError {
+    /// No session was registered under the given id.
+    NotFound,
+    /// The session existed but could not be cancelled cleanly.
+    Failed(String),
+}
+
+/// Terminate a live session by its session id.
+///
+/// Shared by the HTTP close handler and the control socket (`lwt sessions
+/// close`): it removes the job entry, signals the watcher task to kill ttyd,
+/// drops the instance mapping, unlinks the socket and records the lifetime.
+pub async fn terminate_session(
+    session_id: String,
+    job_handle: HandlerState,
+    session_handle: InstanceState,
+    config: Arc<Config>,
+    metrics: Arc<Metrics>,
+) -> Result<String, TerminateError> {
+    if !job_handle.contains_key(&session_id) {
+        tracing::warn!(session = %session_id, "task not found for session key");
+        return Err(TerminateError::NotFound);
+    }
+
+    // attempt to remove the job from the hashmap
+    let Some((sess, handle)) = job_handle.remove(&session_id) else {
+        tracing::warn!(session = %session_id, "failed to close session id");
+        return Err(TerminateError::Failed(
+            "- job not found for session_key or already removed".to_string(),
+        ));
     };
 
-    return resp;
+    // session lifetime, measured from the stored start Instant
+    let started_at = handle.2;
+
+    // send the shutdown signal to the task handler
+    if handle.1.send(()).is_ok() {
+        tracing::info!(session = %sess, "dropped session (closed)");
+        let instance_id = handle.0;
+        // once the task is dropped, remove the session from the instance map
+        session_handle.remove(&instance_id);
+        // remove the socket file on session end
+        crate::utils::remove_socket(&config.unix_socket_folder, &session_id);
+        // record the completed session's lifetime
+        let duration = tokio::time::Instant::now().saturating_duration_since(started_at);
+        metrics.record_session_completed(duration.as_secs());
+        Ok("+ successfully closed the terminal session".to_string())
+    } else {
+        // if sending the shutdown signal fails, preserve the session details and
+        // let the timeout sweep handle the cleanup
+        tracing::warn!(session = %sess, "failed to cancel the session");
+        Err(TerminateError::Failed(
+            "- failed to cancel the session".to_string(),
+        ))
+    }
 }
 
 /*

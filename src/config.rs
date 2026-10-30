@@ -26,6 +26,12 @@ pub struct Config {
     pub jwt_signing_secret: String,
     /// JWT token lifetime, in seconds.
     pub jwt_timeout: u64,
+    /// Caddy binary to supervise (name on `$PATH` or an absolute path).
+    pub caddy_bin: String,
+    /// Path to the Caddyfile the supervised Caddy loads.
+    pub caddy_config: String,
+    /// Whether the daemon starts Caddy automatically on boot.
+    pub caddy_autostart: bool,
 }
 
 /// Why loading [`Config`] from the environment failed.
@@ -87,6 +93,20 @@ impl Config {
         let jwt_signing_secret = required(get, "MZ_TERM_JWT_SINGING_SECRET")?;
         let jwt_timeout = required_parse::<u64>(get, "MZ_TERM_JWT_TIMEOUT")?;
 
+        // Caddy supervision settings are optional and fall back to sensible
+        // defaults, so existing deployments keep working without new variables.
+        let caddy_bin = optional(get, "CADDY_BIN").unwrap_or_else(|| "caddy".to_string());
+        let caddy_config =
+            optional(get, "CADDY_CONFIG").unwrap_or_else(|| "/etc/caddy/Caddyfile".to_string());
+        let caddy_autostart = match optional(get, "CADDY_AUTOSTART") {
+            Some(value) => parse_bool(&value).ok_or_else(|| ConfigError::Invalid {
+                key: "CADDY_AUTOSTART",
+                value: value.clone(),
+                reason: "must be one of true/false/1/0/yes/no".to_string(),
+            })?,
+            None => false,
+        };
+
         if ttyd_session_timeout == 0 {
             return Err(ConfigError::Invalid {
                 key: "TTYD_SESSION_TIMEOUT",
@@ -111,6 +131,9 @@ impl Config {
             serving_name,
             jwt_signing_secret,
             jwt_timeout,
+            caddy_bin,
+            caddy_config,
+            caddy_autostart,
         })
     }
 
@@ -135,6 +158,24 @@ fn required(get: &EnvSource, key: &'static str) -> Result<String, ConfigError> {
             value: "<non-unicode>".to_string(),
             reason: "must be valid unicode".to_string(),
         }),
+    }
+}
+
+/// Read an optional value from the source, treating an unset or empty variable
+/// as absent. A non-unicode value is also treated as absent.
+fn optional(get: &EnvSource, key: &'static str) -> Option<String> {
+    match get(key) {
+        Ok(val) if !val.trim().is_empty() => Some(val),
+        _ => None,
+    }
+}
+
+/// Parse a permissive boolean. Returns `None` for an unrecognised value.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
